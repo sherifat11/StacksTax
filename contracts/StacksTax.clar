@@ -146,3 +146,176 @@
         (ok (/ (* amount (get exchange-rate target-currency-rate)) (get exchange-rate source-currency-rate)))
     )
 )
+
+
+
+(define-read-only (calculate-progressive-tax (income-amount uint) (income-category (string-ascii 24)))
+    (match (map-get? income-tax-brackets { income-category: income-category })
+        bracket-data
+        (let ((total-tax-due u0))
+            (ok (fold calculate-bracket-tax-amount 
+                (get tax-brackets bracket-data)
+                { remaining-income: income-amount, accumulated-tax: u0 })))
+        ERR-TAX-RATE-NOT-FOUND
+    )
+)
+
+
+
+;; Enhanced reporting functions
+(define-read-only (generate-annual-tax-report (taxpayer principal) (tax-year uint))
+    (let (
+        (taxpayer-profile (unwrap! (get-taxpayer-profile taxpayer) ERR-TAX-RATE-NOT-FOUND))
+    )
+        (ok {
+            total-tax-paid: (get cumulative-tax-paid taxpayer-profile),
+            total-tax-refunded: (get cumulative-tax-refunded taxpayer-profile),
+            net-tax-paid: (- (get cumulative-tax-paid taxpayer-profile) (get cumulative-tax-refunded taxpayer-profile)),
+            applied-deductions: (get claimed-deductions taxpayer-profile),
+            payment-transactions: (get transaction-history taxpayer-profile)
+        })
+    )
+)
+
+(define-read-only (calculate-net-tax-obligation (taxpayer principal))
+    (let (
+        (taxpayer-profile (unwrap! (get-taxpayer-profile taxpayer) ERR-TAX-RATE-NOT-FOUND))
+        (total-approved-deductions (fold sum-approved-deductions
+            (get claimed-deductions taxpayer-profile)
+            u0))
+    )
+        (ok (- (get cumulative-tax-paid taxpayer-profile) total-approved-deductions))
+    )
+)
+
+
+
+;; Enhanced public functions
+(define-public (update-exchange-rate (currency-code (string-ascii 10)) (new-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get administrator)) ERR-NOT-AUTHORIZED)
+        (ok (map-set currency-exchange-rates
+            { currency-code: currency-code }
+            { exchange-rate: new-rate,
+              rate-update-timestamp: stacks-block-height,
+              currency-status: true }
+        ))
+    )
+)
+
+(define-public (register-deduction-type (deduction-code (string-ascii 10)) (deduction-name (string-ascii 64)) 
+               (maximum-amount uint) (deduction-percentage uint) (approval-required bool))
+    (begin
+        (asserts! (is-eq tx-sender (var-get administrator)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= deduction-percentage u100) ERR-INVALID-TAX-RATE)
+        (ok (map-set available-deductions
+            { deduction-code: deduction-code }
+            { deduction-name: deduction-name,
+              maximum-deduction-amount: maximum-amount,
+              deduction-percentage: deduction-percentage,
+              approval-required: approval-required }
+        ))
+    )
+)
+
+(define-public (submit-deduction-request (deduction-code (string-ascii 10)) (deduction-amount uint))
+    (let (
+        (deduction-details (unwrap! (get-deduction-info deduction-code) ERR-INVALID-DEDUCTION))
+        (taxpayer-profile (default-to 
+            {
+                cumulative-tax-paid: u0,
+                cumulative-tax-refunded: u0,
+                most-recent-payment: u0,
+                taxpayer-category: "",
+                claimed-deductions: (list ),
+                transaction-history: (list )
+            }
+            (get-taxpayer-profile tx-sender)))
+    )
+        (begin
+            (asserts! (<= deduction-amount (get maximum-deduction-amount deduction-details)) ERR-INVALID-AMOUNT)
+            (ok (map-set taxpayer-profiles
+                tx-sender
+                {
+                    cumulative-tax-paid: (get cumulative-tax-paid taxpayer-profile),
+                    cumulative-tax-refunded: (get cumulative-tax-refunded taxpayer-profile),
+                    most-recent-payment: (get most-recent-payment taxpayer-profile),
+                    taxpayer-category: (get taxpayer-category taxpayer-profile),
+                    claimed-deductions: (unwrap-panic (as-max-len? 
+                        (append (get claimed-deductions taxpayer-profile)
+                            {
+                                deduction-code: deduction-code,
+                                deduction-amount: deduction-amount,
+                                deduction-approved: (not (get approval-required deduction-details))
+                            })
+                        u20)),
+                    transaction-history: (get transaction-history taxpayer-profile)
+                }
+            ))
+        )
+    )
+)
+
+;; Modified approve-deduction-request function
+(define-public (approve-deduction-request (taxpayer principal) (deduction-index uint))
+    (let (
+        (taxpayer-profile (unwrap! (get-taxpayer-profile taxpayer) ERR-TAX-RATE-NOT-FOUND))
+        (current-deductions (get claimed-deductions taxpayer-profile))
+    )
+        (begin
+            (asserts! (is-eq tx-sender (var-get administrator)) ERR-NOT-AUTHORIZED)
+            (asserts! (< deduction-index (len current-deductions)) ERR-INVALID-DEDUCTION)
+
+            (ok (map-set taxpayer-profiles
+                taxpayer
+                {
+                    cumulative-tax-paid: (get cumulative-tax-paid taxpayer-profile),
+                    cumulative-tax-refunded: (get cumulative-tax-refunded taxpayer-profile),
+                    most-recent-payment: (get most-recent-payment taxpayer-profile),
+                    taxpayer-category: (get taxpayer-category taxpayer-profile),
+                    claimed-deductions: (unwrap-panic (as-max-len? 
+                        (map update-deduction-approval 
+                            (list deduction-index)
+                            (list u0)
+                            current-deductions
+                            (list deduction-index))
+                        u20)),
+                    transaction-history: (get transaction-history taxpayer-profile)
+                }
+            ))
+        )
+    )
+)
+
+;; Modified issue-tax-refund function to use native STX transfer
+(define-public (issue-tax-refund (taxpayer principal) (refund-amount uint) (refund-currency (string-ascii 10)))
+    (let (
+        (taxpayer-profile (unwrap! (get-taxpayer-profile taxpayer) ERR-TAX-RATE-NOT-FOUND))
+        (converted-refund-amount (unwrap! (convert-between-currencies refund-amount refund-currency "STX") ERR-INVALID-CURRENCY))
+    )
+        (begin
+            (asserts! (is-eq tx-sender (var-get administrator)) ERR-NOT-AUTHORIZED)
+            (asserts! (<= converted-refund-amount (get cumulative-tax-paid taxpayer-profile)) ERR-REFUND-NOT-ALLOWED)
+            ;; Use stx-transfer instead of contract-call
+            (try! (stx-transfer? converted-refund-amount (var-get administrator) taxpayer))
+            (ok (map-set taxpayer-profiles
+                taxpayer
+                {
+                    cumulative-tax-paid: (get cumulative-tax-paid taxpayer-profile),
+                    cumulative-tax-refunded: (+ (get cumulative-tax-refunded taxpayer-profile) converted-refund-amount),
+                    most-recent-payment: (get most-recent-payment taxpayer-profile),
+                    taxpayer-category: (get taxpayer-category taxpayer-profile),
+                    claimed-deductions: (get claimed-deductions taxpayer-profile),
+                    transaction-history: (unwrap-panic (as-max-len?
+                        (append (get transaction-history taxpayer-profile)
+                            { 
+                                transaction-amount: (- u0 converted-refund-amount),
+                                transaction-timestamp: stacks-block-height,
+                                transaction-currency: refund-currency 
+                            })
+                        u50))
+                }
+            ))
+        )
+    )
+)
